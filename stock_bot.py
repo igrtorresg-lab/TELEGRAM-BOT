@@ -59,7 +59,7 @@ EXTRA_COLLECTIONS = [
 
 # Una colección cuenta como "One Piece" si su nombre/handle coincide con esto
 COLLECTION_RE = re.compile(
-    r"one[-\s]?piece|(^|[-\s])(op|eb|prb|st)-?\d|illustration[-\s]box|"
+    r"one[-\s]?piece|(^|[-\s])op([-\s]|$)|illustration[-\s]box|"
     r"premium[-\s](extra[-\s])?booster|extra[-\s]booster",
     re.IGNORECASE,
 )
@@ -81,6 +81,37 @@ SINGLES_RE = re.compile(
     r"single|suelta|accesorio|sleeve|playmat|protector|deck-?box|carpeta|album",
     re.IGNORECASE,
 )
+
+
+# --- Filtros por PRODUCTO (se aplican dentro de cada colección) -----------
+# Carta suelta: código de carta tipo OP09-118, EB01-006, ST05-002, PRB01-001
+SINGLE_CARD_RE = re.compile(r"(?<![a-z])(op|eb|prb|st)-?\d{2}-\d{2,3}", re.IGNORECASE)
+
+# Accesorios, otros juegos, promos/variantes y productos de prueba
+UNWANTED_RE = re.compile(
+    r"sleeve|playmat|protector|porta[-\s]?mazo|deck[-\s]?box|(^|[-\s])dice([-\s]|$)|"
+    r"lego|paper[-\s]theater|tournament|prueba|"
+    r"gundam|digimon|pok[eé]mon|(^|[-\s])magic([-\s]|$)|mtg|riftbound|dragon[-\s]?ball|"
+    r"hololive|yu[-\s]?gi[-\s]?oh|"
+    r"iron[-\s]blooded|eternal[-\s]nexus|g[-\s]generation|aquatic[-\s]assault|"
+    r"heavy[-\s]dominion|flash[-\s]of[-\s]radiance|amethyst[-\s]mandala|data[-\s]squad|"
+    r"unicorn|cosmic[-\s]crisis|destiny[-\s]ignition|generational[-\s]pulse|"
+    r"promotion[-\s]cards|(^|[-\s])op[-\s]pr([-\s]|$)|jolly[-\s]roger[-\s]foil|"
+    r"super[-\s]pre[-\s]release|alternate[-\s]art|parallel|manga|(^|[-\s])p[-\s]\d{3}",
+    re.IGNORECASE,
+)
+
+
+def is_unwanted(p):
+    """True si el producto es carta suelta, accesorio u otro juego."""
+    handle = p["handle"].lower()
+    text = f"{handle} {p['title'].lower()}"
+    return bool(
+        UNWANTED_RE.search(text)
+        or SINGLE_CARD_RE.search(text)
+        or re.search(r"-\d{6}$", handle)          # cartas sueltas de La Comarca
+        or re.search(r"(^|-)don(-|$)", handle)      # cartas DON!!
+    )
 
 
 def get_json(url, **params):
@@ -132,6 +163,8 @@ def scan_store(base):
     found = {}
     for col_url, only_title, handle in targets:
         for p in fetch_products(col_url):
+            if is_unwanted(p):
+                continue
             if only_title and not TITLE_RE.search(p["title"]):
                 continue
             link = f"{base}/products/{p['handle']}"
@@ -175,6 +208,45 @@ def telegram(text, image=None):
     r.raise_for_status()
 
 
+def enviar_lista(results):
+    """Manda a Telegram la lista de productos con stock, agrupada por tienda."""
+    lines, total = [], 0
+    for base, found, err in results:
+        if err is not None or not found:
+            continue
+        en_stock = [(l, p) for l, p in found.items() if p["available"]]
+        if not en_stock:
+            continue
+        total += len(en_stock)
+        lines.append(f"\n<b>{html.escape(base.replace('https://', ''))}</b>")
+        for link, p in sorted(en_stock, key=lambda x: x[1]["title"].lower()):
+            price = f"${p['price']:,.0f}".replace(",", ".")
+            pre = " ⏳" if p["preorder"] else ""
+            lines.append(f'• <a href="{link}">{html.escape(p["title"])}</a> — {price}{pre}')
+    if not lines:
+        telegram("📋 Ahora mismo no hay productos con stock en las tiendas vigiladas.")
+        return
+    header = f"📋 <b>Productos con stock ahora: {total}</b>  (⏳ = preventa)"
+    messages, cur = [], header
+    for line in lines:
+        if len(cur) + len(line) + 1 > 3800:
+            messages.append(cur)
+            cur = ""
+        cur += "\n" + line
+    messages.append(cur)
+    for m in messages:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": m, "parse_mode": "HTML",
+                  "disable_web_page_preview": True},
+            timeout=30,
+        )
+        if not r.ok:
+            print("Telegram error:", r.status_code, r.text)
+        r.raise_for_status()
+        time.sleep(1)
+
+
 def main():
     first_run = not STATE_FILE.exists()
     old = {} if first_run else json.loads(STATE_FILE.read_text())
@@ -211,6 +283,9 @@ def main():
             f"✅ Bot iniciado. Vigilando {len(new)} productos "
             f"({sum(new.values())} con stock ahora) en {len(STORES) - failed} tiendas."
         )
+
+    if os.environ.get("LISTAR", "").lower() == "true":
+        enviar_lista(results)
 
     STATE_FILE.write_text(json.dumps(new, indent=1, sort_keys=True))
     sys.exit(1 if failed == len(STORES) else 0)
