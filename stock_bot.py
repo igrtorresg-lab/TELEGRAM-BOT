@@ -1,9 +1,12 @@
 """
-Bot de stock -> Telegram (autodescubre colecciones de One Piece).
+Bot de stock -> Telegram (autodescubre colecciones de One Piece y preventas).
 
 Para cada tienda Shopify:
-  1) lee /collections.json y se queda con las colecciones de One Piece
-     (cajas, sobres, decks, premium, illustration box, preventas...)
+  1) lee /collections.json y detecta dos tipos de colecciones:
+       - de One Piece (cajas, sobres, decks, premium, illustration box...):
+         vigila TODOS sus productos
+       - de preventa (mezclan varios juegos): vigila solo los productos
+         One Piece / OP / ST / EB / PRB (incluye ST-38)
   2) lee los productos de esas colecciones
   3) te avisa por Telegram, con foto y link, cuando uno pasa a tener stock
 
@@ -49,7 +52,7 @@ STORES = [
     "https://dyskeu.cl",
 ]
 
-# Colecciones extra que quieras forzar (URL completa de la colección)
+# Colecciones extra que quieras forzar (URL completa). Se vigilan TODOS sus productos.
 EXTRA_COLLECTIONS = [
     # "https://oasisgames.cl/collections/one-piece-sealed",
 ]
@@ -60,6 +63,18 @@ COLLECTION_RE = re.compile(
     r"premium[-\s](extra[-\s])?booster|extra[-\s]booster",
     re.IGNORECASE,
 )
+
+# Colecciones de preventa (mezclan juegos: solo se guardan productos One Piece)
+PREVENTA_RE = re.compile(r"pre[-\s]?venta|pre[-\s]?order", re.IGNORECASE)
+
+# Nombres de producto que interesan dentro de las colecciones de preventa
+# (st-?\d cubre ST-38 y cualquier otro starter deck)
+TITLE_RE = re.compile(
+    r"one[-\s]?piece|\b(op|eb|prb|st)-?\d{1,2}\b|illustration[-\s]box|"
+    r"premium[-\s](extra[-\s])?booster|extra[-\s]booster",
+    re.IGNORECASE,
+)
+
 # Se excluyen cartas sueltas y accesorios: solo interesa el producto sellado
 INCLUDE_SINGLES = False
 SINGLES_RE = re.compile(
@@ -75,6 +90,7 @@ def get_json(url, **params):
 
 
 def discover_collections(base):
+    """Devuelve [(handle, solo_titulos_one_piece)]."""
     cols, page = [], 1
     while True:
         batch = get_json(f"{base}/collections.json", limit=250, page=page)["collections"]
@@ -83,17 +99,18 @@ def discover_collections(base):
             break
         page += 1
         time.sleep(0.5)
-    handles = []
+    found = []
     for c in cols:
         text = f"{c['handle']} {c.get('title', '')}"
         if c.get("products_count", 1) == 0:
             continue
-        if not COLLECTION_RE.search(text):
-            continue
         if not INCLUDE_SINGLES and SINGLES_RE.search(text):
             continue
-        handles.append(c["handle"])
-    return handles
+        if COLLECTION_RE.search(text):
+            found.append((c["handle"], False))
+        elif PREVENTA_RE.search(text):
+            found.append((c["handle"], True))
+    return found
 
 
 def fetch_products(col_url):
@@ -109,13 +126,14 @@ def fetch_products(col_url):
 
 
 def scan_store(base):
-    """Devuelve {link: {title, available, price, image}} de la tienda."""
-    handles = discover_collections(base)
-    col_urls = [f"{base}/collections/{h}" for h in handles]
-    col_urls += [u.rstrip("/") for u in EXTRA_COLLECTIONS if u.startswith(base)]
+    """Devuelve {link: {title, available, price, image, preorder}} de la tienda."""
+    targets = [(f"{base}/collections/{h}", only_title, h) for h, only_title in discover_collections(base)]
+    targets += [(u.rstrip("/"), False, u) for u in EXTRA_COLLECTIONS if u.startswith(base)]
     found = {}
-    for cu in col_urls:
-        for p in fetch_products(cu):
+    for col_url, only_title, handle in targets:
+        for p in fetch_products(col_url):
+            if only_title and not TITLE_RE.search(p["title"]):
+                continue
             link = f"{base}/products/{p['handle']}"
             prices = [float(v["price"]) for v in p["variants"] if v.get("available")]
             found[link] = {
@@ -123,9 +141,10 @@ def scan_store(base):
                 "available": bool(prices),
                 "price": min(prices) if prices else None,
                 "image": p["images"][0]["src"] if p.get("images") else None,
+                "preorder": bool(PREVENTA_RE.search(handle) or PREVENTA_RE.search(p["title"])),
             }
         time.sleep(0.5)
-    print(f"{base}: {len(col_urls)} colecciones, {len(found)} productos")
+    print(f"{base}: {len(targets)} colecciones, {len(found)} productos")
     return found
 
 
@@ -174,8 +193,10 @@ def main():
             new[link] = p["available"]
             if p["available"] and not old.get(link, False) and not first_run:
                 price = f"${p['price']:,.0f}".replace(",", ".")
+                tag = "⏳ <b>Preventa</b>\n" if p["preorder"] else ""
                 alerts.append((
                     f"🟢 <b>{html.escape(p['title'])}</b>\n"
+                    f"{tag}"
                     f"Desde {price} CLP\n"
                     f'<a href="{link}">Ver producto</a>',
                     p["image"],
