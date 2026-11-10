@@ -97,7 +97,15 @@ UNWANTED_RE = re.compile(
     r"heavy[-\s]dominion|flash[-\s]of[-\s]radiance|amethyst[-\s]mandala|data[-\s]squad|"
     r"unicorn|cosmic[-\s]crisis|destiny[-\s]ignition|generational[-\s]pulse|"
     r"promotion[-\s]cards|(^|[-\s])op[-\s]pr([-\s]|$)|jolly[-\s]roger[-\s]foil|"
-    r"super[-\s]pre[-\s]release|alternate[-\s]art|parallel|manga|(^|[-\s])p[-\s]\d{3}",
+    r"super[-\s]pre[-\s]release|pre[-\s]release[-\s]cards|alternate[-\s]art|parallel|manga|"
+    r"pirate[-\s]foil|full[-\s]art|bandai[-\s]card[-\s]games[-\s]fest|(^|[-\s])p[-\s]?\d{3}([-\s]|$)|"
+    r"^[a-z]+(-[a-z]+)?-premium-card-collection",   # carta promo: "izo-premium-card-collection..."
+    re.IGNORECASE,
+)
+
+# Identidad One Piece: el producto DEBE decir "one piece" o llevar un código OP/EB/PRB/ST/IB/DP/TS/SD...
+ONE_PIECE_RE = re.compile(
+    r"one[-\s]?piece|(^|-)op-|(^|[^a-z])(op|eb|prb|st|ib|dp|ts|sd|ln|lt|df|peb)-?\d{1,2}([^0-9a-z]|$)",
     re.IGNORECASE,
 )
 
@@ -106,6 +114,8 @@ def is_unwanted(p):
     """True si el producto es carta suelta, accesorio u otro juego."""
     handle = p["handle"].lower()
     text = f"{handle} {p['title'].lower()}"
+    if not ONE_PIECE_RE.search(text):
+        return True                                  # no es de One Piece (Pokémon, Dragon Ball...)
     return bool(
         UNWANTED_RE.search(text)
         or SINGLE_CARD_RE.search(text)
