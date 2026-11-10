@@ -46,6 +46,8 @@ STORES = [
     "https://oneupstore.cl",
     "https://metagame.cl",
     "https://progaming.cl",
+    "https://tcglifestore.cl/",
+    "https://cardhousegaming.com/",
     "https://bastiongoblin.com",
     "https://tecitogames.com",
     "https://tablecatgames.cl",
