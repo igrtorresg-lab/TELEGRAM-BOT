@@ -1,7 +1,11 @@
 """
-Bot de stock -> Telegram.
-Revisa tiendas Shopify (products.json) y avisa, con imagen y link, cuando un
-producto cuyo nombre coincide con tus palabras clave pasa a estar disponible.
+Bot de stock -> Telegram (autodescubre colecciones de One Piece).
+
+Para cada tienda Shopify:
+  1) lee /collections.json y se queda con las colecciones de One Piece
+     (cajas, sobres, decks, premium, illustration box, preventas...)
+  2) lee los productos de esas colecciones
+  3) te avisa por Telegram, con foto y link, cuando uno pasa a tener stock
 
 Variables de entorno requeridas: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 """
@@ -11,6 +15,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -20,8 +25,8 @@ CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 STATE_FILE = Path("state.json")
 HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 
-# --- Tiendas a vigilar (una por línea, SIEMPRE con coma al final) ---------
-COLLECTIONS = [
+# --- Tiendas (una por línea, SIEMPRE con coma al final) -------------------
+STORES = [
     "https://oasisgames.cl",
     "https://drawn.cl",
     "https://tiendalacomarca.cl",
@@ -42,43 +47,93 @@ COLLECTIONS = [
     "https://tecitogames.com",
     "https://tablecatgames.cl",
     "https://dyskeu.cl",
-    # Tiendaoops: agregar cuando sepamos su estructura
 ]
 
-# --- Palabras clave (regex, sin distinguir mayúsculas) -------------------
-PATTERNS = [
-    r"one piece",
-    r"\bop-",              # "OP-14"
-    r"\bop-?\d{2}\b",      # "OP14" sin guion
-    r"illustration box vol",
-    r"premium (extra )?booster",
+# Colecciones extra que quieras forzar (URL completa de la colección)
+EXTRA_COLLECTIONS = [
+    # "https://oasisgames.cl/collections/one-piece-sealed",
 ]
-REGEX = re.compile("|".join(PATTERNS), re.IGNORECASE)
+
+# Una colección cuenta como "One Piece" si su nombre/handle coincide con esto
+COLLECTION_RE = re.compile(
+    r"one[-\s]?piece|(^|[-\s])(op|eb|prb|st)-?\d|illustration[-\s]box|"
+    r"premium[-\s](extra[-\s])?booster|extra[-\s]booster",
+    re.IGNORECASE,
+)
+# Se excluyen cartas sueltas y accesorios: solo interesa el producto sellado
+INCLUDE_SINGLES = False
+SINGLES_RE = re.compile(
+    r"single|suelta|accesorio|sleeve|playmat|protector|deck-?box|carpeta|album",
+    re.IGNORECASE,
+)
 
 
-def fetch_collection(url):
-    url = url.rstrip("/")
+def get_json(url, **params):
+    r = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def discover_collections(base):
+    cols, page = [], 1
+    while True:
+        batch = get_json(f"{base}/collections.json", limit=250, page=page)["collections"]
+        cols += batch
+        if len(batch) < 250:
+            break
+        page += 1
+        time.sleep(0.5)
+    handles = []
+    for c in cols:
+        text = f"{c['handle']} {c.get('title', '')}"
+        if c.get("products_count", 1) == 0:
+            continue
+        if not COLLECTION_RE.search(text):
+            continue
+        if not INCLUDE_SINGLES and SINGLES_RE.search(text):
+            continue
+        handles.append(c["handle"])
+    return handles
+
+
+def fetch_products(col_url):
     products, page = [], 1
     while True:
-        r = requests.get(
-            f"{url}/products.json",
-            params={"limit": 250, "page": page},
-            headers=HEADERS,
-            timeout=30,
-        )
-        r.raise_for_status()
-        batch = r.json()["products"]
+        batch = get_json(f"{col_url}/products.json", limit=250, page=page)["products"]
         products += batch
         if len(batch) < 250:
             break
         page += 1
-        time.sleep(1)
+        time.sleep(0.5)
     return products
 
 
-def base_of(url):
-    m = re.match(r"(https?://[^/]+)", url)
-    return m.group(1)
+def scan_store(base):
+    """Devuelve {link: {title, available, price, image}} de la tienda."""
+    handles = discover_collections(base)
+    col_urls = [f"{base}/collections/{h}" for h in handles]
+    col_urls += [u.rstrip("/") for u in EXTRA_COLLECTIONS if u.startswith(base)]
+    found = {}
+    for cu in col_urls:
+        for p in fetch_products(cu):
+            link = f"{base}/products/{p['handle']}"
+            prices = [float(v["price"]) for v in p["variants"] if v.get("available")]
+            found[link] = {
+                "title": p["title"],
+                "available": bool(prices),
+                "price": min(prices) if prices else None,
+                "image": p["images"][0]["src"] if p.get("images") else None,
+            }
+        time.sleep(0.5)
+    print(f"{base}: {len(col_urls)} colecciones, {len(found)} productos")
+    return found
+
+
+def safe_scan(base):
+    try:
+        return base, scan_store(base), None
+    except Exception as e:  # noqa: BLE001
+        return base, None, e
 
 
 def telegram(text, image=None):
@@ -104,37 +159,26 @@ def telegram(text, image=None):
 def main():
     first_run = not STATE_FILE.exists()
     old = {} if first_run else json.loads(STATE_FILE.read_text())
-    new = {}
-    alerts = []
-    failed = 0
+    new, alerts, failed = {}, [], 0
 
-    for col in COLLECTIONS:
-        try:
-            products = fetch_collection(col)
-        except Exception as e:  # noqa: BLE001
-            print(f"ERROR {col}: {e}", file=sys.stderr)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(safe_scan, STORES))
+
+    for base, found, err in results:
+        if err is not None:
+            print(f"ERROR {base}: {err}", file=sys.stderr)
             failed += 1
-            # conserva el estado anterior de esa tienda
-            prefix = base_of(col) + "/products/"
-            new.update({k: v for k, v in old.items() if k.startswith(prefix)})
+            new.update({k: v for k, v in old.items() if k.startswith(base + "/products/")})
             continue
-
-        for p in products:
-            title = p["title"]
-            if not REGEX.search(title):
-                continue
-            link = f"{base_of(col)}/products/{p['handle']}"
-            avail_prices = [float(v["price"]) for v in p["variants"] if v.get("available")]
-            available = bool(avail_prices)
-            new[link] = available
-            if available and not old.get(link, False) and not first_run:
-                price = f"${min(avail_prices):,.0f}".replace(",", ".")
-                image = p["images"][0]["src"] if p.get("images") else None
+        for link, p in found.items():
+            new[link] = p["available"]
+            if p["available"] and not old.get(link, False) and not first_run:
+                price = f"${p['price']:,.0f}".replace(",", ".")
                 alerts.append((
-                    f"🟢 <b>{html.escape(title)}</b>\n"
+                    f"🟢 <b>{html.escape(p['title'])}</b>\n"
                     f"Desde {price} CLP\n"
                     f'<a href="{link}">Ver producto</a>',
-                    image,
+                    p["image"],
                 ))
 
     for msg, image in alerts:
@@ -142,15 +186,13 @@ def main():
         time.sleep(1)
 
     if first_run:
-        en_stock = sum(new.values())
         telegram(
             f"✅ Bot iniciado. Vigilando {len(new)} productos "
-            f"({en_stock} con stock ahora). Te aviso cuando alguno nuevo tenga stock."
+            f"({sum(new.values())} con stock ahora) en {len(STORES) - failed} tiendas."
         )
 
     STATE_FILE.write_text(json.dumps(new, indent=1, sort_keys=True))
-    # Solo marca error si fallaron TODAS las tiendas
-    sys.exit(1 if failed == len(COLLECTIONS) else 0)
+    sys.exit(1 if failed == len(STORES) else 0)
 
 
 if __name__ == "__main__":
