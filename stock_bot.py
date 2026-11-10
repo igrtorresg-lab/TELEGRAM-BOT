@@ -44,6 +44,7 @@ STORES = [
     "https://piedrabruja.cl",
     "https://mirax.cl",
     "https://oneupstore.cl",
+    "https://www.huntercardtcg.com/",
     "https://metagame.cl",
     "https://progaming.cl",
     "https://tcglifestore.cl/",
