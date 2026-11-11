@@ -1,16 +1,19 @@
 """
 Bot de stock -> Telegram (autodescubre colecciones de One Piece y preventas).
 
-Para cada tienda Shopify:
-  1) lee /collections.json y detecta dos tipos de colecciones:
-       - de One Piece (cajas, sobres, decks, premium, illustration box...):
-         vigila TODOS sus productos
-       - de preventa (mezclan varios juegos): vigila solo los productos
-         One Piece / OP / ST / EB / PRB (incluye ST-38)
-  2) lee los productos de esas colecciones
-  3) te avisa por Telegram, con foto y link, cuando uno pasa a tener stock
+Para cada tienda detecta la plataforma automáticamente:
+  - Shopify      -> /collections.json + /products.json
+  - WooCommerce  -> Store API pública (/wp-json/wc/store/v1/...)
+  - HTML_STORES  -> lectura del HTML de categorías (Tiendanube, Bsale, etc.)
+  - Otra / bloqueada -> se omite con un aviso (no rompe el run ni borra su estado)
+
+En cada tienda vigila:
+  - categorías/colecciones de One Piece: TODOS sus productos (sellados)
+  - categorías de preventa: solo los productos One Piece / OP / ST / EB / PRB
+y te avisa por Telegram, con foto y link, cuando uno pasa a tener stock.
 
 Variables de entorno requeridas: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+Opcionales: DIAG=true (solo diagnóstico de plataformas), LISTAR=true (envía la lista con stock)
 """
 import html
 import json
@@ -20,15 +23,17 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 STATE_FILE = Path("state.json")
 HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 
 # --- Tiendas (una por línea, SIEMPRE con coma al final) -------------------
+# Da igual si terminan en "/" o si se repiten: se normalizan abajo.
 STORES = [
     "https://oasisgames.cl",
     "https://drawn.cl",
@@ -44,23 +49,24 @@ STORES = [
     "https://piedrabruja.cl",
     "https://mirax.cl",
     "https://oneupstore.cl",
-    "https://www.huntercardtcg.com/",
     "https://metagame.cl",
     "https://progaming.cl",
-    "https://tcglifestore.cl/",
-    "https://cardhousegaming.com/",
     "https://bastiongoblin.com",
     "https://tecitogames.com",
     "https://tablecatgames.cl",
     "https://dyskeu.cl",
+    "https://cardhousegaming.com",
 ]
+STORES = list(dict.fromkeys(s.strip().rstrip("/") for s in STORES if s.strip()))
 
-# Tiendas que NO son Shopify: se leen desde el HTML de sus categorías.
-# type "tiendanube" (File City). Cada ruta: (ruta, solo_titulos_one_piece)
-#   False = toda la categoría es One Piece | True = categoría mezclada (preventas): se filtra por nombre
+# Tiendas que se leen desde el HTML de sus categorías (no tienen API pública).
+#   product_path: prefijo de la URL de cada producto en esa plataforma
+#       Tiendanube -> "/productos/"   |   Bsale -> "/product/"
+#   paths: (ruta_categoria, solo_titulos_one_piece)
+#       False = toda la categoría es One Piece | True = categoría mezclada (preventas)
 HTML_STORES = {
     "https://filecity.cl": {
-        "type": "tiendanube",
+        "product_path": "/productos/",
         "paths": [
             ("/one-piece-card-game/", False),
             ("/pre-ventas1/", True),
@@ -68,12 +74,12 @@ HTML_STORES = {
     },
 }
 
-# Colecciones extra que quieras forzar (URL completa). Se vigilan TODOS sus productos.
+# Colecciones Shopify extra que quieras forzar (URL completa). Se vigilan TODOS sus productos.
 EXTRA_COLLECTIONS = [
     # "https://oasisgames.cl/collections/one-piece-sealed",
 ]
 
-# Una colección cuenta como "One Piece" si su nombre/handle coincide con esto
+# Una colección/categoría cuenta como "One Piece" si su nombre/handle coincide con esto
 COLLECTION_RE = re.compile(
     r"one[-\s]?piece|(^|[-\s])op([-\s]|$)|illustration[-\s]box|"
     r"premium[-\s](extra[-\s])?booster|extra[-\s]booster",
@@ -84,7 +90,6 @@ COLLECTION_RE = re.compile(
 PREVENTA_RE = re.compile(r"pre[-\s]?venta|pre[-\s]?order", re.IGNORECASE)
 
 # Nombres de producto que interesan dentro de las colecciones de preventa
-# (st-?\d cubre ST-38 y cualquier otro starter deck)
 TITLE_RE = re.compile(
     r"one[-\s]?piece|\b(op|eb|prb|st)-?\d{1,2}\b|illustration[-\s]box|"
     r"premium[-\s](extra[-\s])?booster|extra[-\s]booster",
@@ -100,10 +105,8 @@ SINGLES_RE = re.compile(
 
 
 # --- Filtros por PRODUCTO (se aplican dentro de cada colección) -----------
-# Carta suelta: código de carta tipo OP09-118, EB01-006, ST05-002, PRB01-001
 SINGLE_CARD_RE = re.compile(r"(?<![a-z])(op|eb|prb|st)-?\d{2}-\d{2,3}", re.IGNORECASE)
 
-# Accesorios, otros juegos, promos/variantes y productos de prueba
 UNWANTED_RE = re.compile(
     r"sleeve|playmat|protector|porta[-\s]?mazo|deck[-\s]?box|(^|[-\s])dice([-\s]|$)|"
     r"lego|paper[-\s]theater|tournament|prueba|"
@@ -115,15 +118,18 @@ UNWANTED_RE = re.compile(
     r"promotion[-\s]cards|(^|[-\s])op[-\s]pr([-\s]|$)|jolly[-\s]roger[-\s]foil|"
     r"super[-\s]pre[-\s]release|pre[-\s]release[-\s]cards|alternate[-\s]art|parallel|manga|"
     r"pirate[-\s]foil|full[-\s]art|bandai[-\s]card[-\s]games[-\s]fest|(^|[-\s])p[-\s]?\d{3}([-\s]|$)|"
-    r"^[a-z]+(-[a-z]+)?-premium-card-collection",   # carta promo: "izo-premium-card-collection..."
+    r"^[a-z]+(-[a-z]+)?-premium-card-collection",
     re.IGNORECASE,
 )
 
-# Identidad One Piece: el producto DEBE decir "one piece" o llevar un código OP/EB/PRB/ST/IB/DP/TS/SD...
 ONE_PIECE_RE = re.compile(
     r"one[-\s]?piece|(^|-)op-|(^|[^a-z])(op|eb|prb|st|ib|dp|ts|sd|ln|lt|df|peb)-?\d{1,2}([^0-9a-z]|$)",
     re.IGNORECASE,
 )
+
+
+class UnsupportedStore(Exception):
+    """La tienda no es de una plataforma que el bot sepa leer (o bloquea al bot)."""
 
 
 def is_unwanted(p):
@@ -131,12 +137,12 @@ def is_unwanted(p):
     handle = p["handle"].lower()
     text = f"{handle} {p['title'].lower()}"
     if not ONE_PIECE_RE.search(text):
-        return True                                  # no es de One Piece (Pokémon, Dragon Ball...)
+        return True
     return bool(
         UNWANTED_RE.search(text)
         or SINGLE_CARD_RE.search(text)
         or re.search(r"-\d{6}$", handle)          # cartas sueltas de La Comarca
-        or re.search(r"(^|-)don(-|$)", handle)      # cartas DON!!
+        or re.search(r"(^|-)don(-|$)", handle)    # cartas DON!!
     )
 
 
@@ -146,6 +152,59 @@ def get_json(url, **params):
     return r.json()
 
 
+def fmt_price(price):
+    return f"${price:,.0f}".replace(",", ".") if price is not None else "precio no visible"
+
+
+# --- Detección de plataforma -------------------------------------------------
+PLATFORM_MARKS = [
+    ("tiendanube", r"mitiendanube|nuvemshop|tiendanube"),
+    ("shopify", r"cdn\.shopify|myshopify"),
+    ("jumpseller", r"jumpseller"),
+    ("woocommerce", r"woocommerce|wp-content"),
+    ("bsale", r"bsale"),
+    ("magento", r"magento|mage-"),
+    ("prestashop", r"prestashop"),
+    ("wix", r"wixstatic"),
+    ("vtex", r"vtex"),
+]
+WOO_APIS = ("/wp-json/wc/store/v1", "/wp-json/wc/store")
+
+
+def _probe_json(url, key=None, **params):
+    """Devuelve el JSON si la URL responde JSON válido (y trae `key`), si no None."""
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except (requests.RequestException, ValueError):
+        return None
+    if key is not None and not (isinstance(data, dict) and key in data):
+        return None
+    return data
+
+
+def detect_platform(base):
+    """Devuelve (plataforma, detalle). plataforma: shopify | woocommerce | html | otra."""
+    if base in HTML_STORES:
+        return "html", ""
+    if _probe_json(f"{base}/products.json", key="products", limit=1) is not None:
+        return "shopify", ""
+    for api in WOO_APIS:
+        if isinstance(_probe_json(f"{base}{api}/products", per_page=1), list):
+            return "woocommerce", api
+    try:
+        r = requests.get(base, headers=HEADERS, timeout=20)
+    except requests.RequestException as e:
+        return "otra", f"sin conexión ({type(e).__name__})"
+    if r.status_code in (401, 403, 429, 503):
+        return "otra", f"bloquea al bot (HTTP {r.status_code})"
+    marks = [n for n, pat in PLATFORM_MARKS if re.search(pat, r.text, re.IGNORECASE)]
+    return "otra", f"plataforma={marks or '?'} (HTTP {r.status_code})"
+
+
+# --- Shopify -------------------------------------------------------------------
 def discover_collections(base):
     """Devuelve [(handle, solo_titulos_one_piece)]."""
     cols, page = [], 1
@@ -182,10 +241,7 @@ def fetch_products(col_url):
     return products
 
 
-def scan_store(base):
-    """Devuelve {link: {title, available, price, image, preorder}} de la tienda."""
-    if base in HTML_STORES:
-        return scan_html_store(base, HTML_STORES[base])
+def scan_shopify(base):
     targets = [(f"{base}/collections/{h}", only_title, h) for h, only_title in discover_collections(base)]
     targets += [(u.rstrip("/"), False, u) for u in EXTRA_COLLECTIONS if u.startswith(base)]
     found = {}
@@ -195,9 +251,8 @@ def scan_store(base):
                 continue
             if only_title and not TITLE_RE.search(p["title"]):
                 continue
-            link = f"{base}/products/{p['handle']}"
             prices = [float(v["price"]) for v in p["variants"] if v.get("available")]
-            found[link] = {
+            found[f"{base}/products/{p['handle']}"] = {
                 "title": p["title"],
                 "available": bool(prices),
                 "price": min(prices) if prices else None,
@@ -205,13 +260,69 @@ def scan_store(base):
                 "preorder": bool(PREVENTA_RE.search(handle) or PREVENTA_RE.search(p["title"])),
             }
         time.sleep(0.5)
-    print(f"{base}: {len(targets)} colecciones, {len(found)} productos")
+    print(f"{base}: Shopify, {len(targets)} colecciones, {len(found)} productos")
     return found
 
 
-# --- Lectura de tiendas Tiendanube (HTML) -----------------------------------
-def _slug_of(a):
-    m = re.search(r"/productos/([^/?#]+)", a.get("href") or "")
+# --- WooCommerce (Store API pública, sin credenciales) --------------------------
+def _woo_paged(url, **params):
+    items, page = [], 1
+    while True:
+        batch = get_json(url, per_page=100, page=page, **params)
+        items += batch
+        if len(batch) < 100:
+            return items
+        page += 1
+        time.sleep(0.5)
+
+
+def scan_woocommerce(base, api):
+    cats = _woo_paged(f"{base}{api}/products/categories")
+    targets = []   # (params, solo_titulos, nombre_categoria)
+    for c in cats:
+        text = f"{c.get('slug', '')} {html.unescape(c.get('name', ''))}"
+        if c.get("count", 1) == 0:
+            continue
+        if not INCLUDE_SINGLES and SINGLES_RE.search(text):
+            continue
+        if COLLECTION_RE.search(text):
+            targets.append(({"category": c["id"]}, False, text))
+        elif PREVENTA_RE.search(text):
+            targets.append(({"category": c["id"]}, True, text))
+    if not targets:   # sin categorías reconocibles: búsqueda por texto
+        targets = [({"search": "one piece"}, False, "")]
+
+    found = {}
+    for params, only_title, cat_text in targets:
+        for p in _woo_paged(f"{base}{api}/products", **params):
+            title = html.unescape(p.get("name", ""))
+            if is_unwanted({"handle": p.get("slug", ""), "title": title}):
+                continue
+            if only_title and not TITLE_RE.search(title):
+                continue
+            pr = p.get("prices") or {}
+            try:
+                price = int(pr["price"]) / 10 ** int(pr.get("currency_minor_unit", 0))
+            except (KeyError, TypeError, ValueError):
+                price = None
+            # se arma el link con el dominio configurado (evita duplicados www / sin www)
+            path = urlparse(p.get("permalink", "")).path or f"/?p={p.get('id')}"
+            cat_names = " ".join(html.unescape(c.get("name", "")) for c in p.get("categories", []))
+            found[base + path] = {
+                "title": title,
+                "available": bool(p.get("is_in_stock")) and p.get("is_purchasable", True),
+                "price": price,
+                "image": (p.get("images") or [{}])[0].get("src"),
+                "preorder": bool(PREVENTA_RE.search(f"{cat_text} {cat_names} {title}")),
+            }
+        time.sleep(0.5)
+    print(f"{base}: WooCommerce, {len(targets)} categorías, {len(found)} productos")
+    return found
+
+
+# --- Tiendas leídas desde HTML (Tiendanube, Bsale...) ---------------------------
+def _slug_of(a, product_path):
+    m = re.search(re.escape(product_path) + r"([^/?#]+)", a.get("href") or "")
     return m.group(1) if m else None
 
 
@@ -240,34 +351,34 @@ def _img_url(card, base):
     return None
 
 
-def parse_tiendanube(html_text, base):
+def parse_html_listing(html_text, base, product_path):
     """Devuelve {slug: {title, available, price, image}} de una página de categoría."""
     try:
         from bs4 import BeautifulSoup
-    except ImportError as e:  # noqa: BLE001
+    except ImportError as e:
         raise RuntimeError("falta beautifulsoup4 (pip install beautifulsoup4)") from e
     soup = BeautifulSoup(html_text, "html.parser")
     items = {}
     for a in soup.find_all("a", href=True):
-        slug = _slug_of(a)
+        slug = _slug_of(a, product_path)
         if not slug or slug in items:
             continue
         # la "tarjeta" es el elemento más grande que contiene solo este producto
         card, levels = a, 0
         while card.parent is not None and card.parent.name not in ("body", "html", "[document]") and levels < 8:
-            slugs = {_slug_of(x) for x in card.parent.find_all("a", href=True)} - {None}
+            slugs = {_slug_of(x, product_path) for x in card.parent.find_all("a", href=True)} - {None}
             if len(slugs) > 1:
                 break
             card, levels = card.parent, levels + 1
         text = card.get_text(" ", strip=True)
         title = next((x["title"] for x in card.find_all("a", href=True)
-                      if _slug_of(x) == slug and x.get("title")), "")
+                      if _slug_of(x, product_path) == slug and x.get("title")), "")
         if not title:
             img = card.find("img", alt=True)
             title = (img["alt"] if img and img["alt"] else "").strip()
         if not title:
             title = max((x.get_text(" ", strip=True) for x in card.find_all("a", href=True)
-                         if _slug_of(x) == slug), key=len, default=slug)
+                         if _slug_of(x, product_path) == slug), key=len, default=slug)
         items[slug] = {
             "title": title,
             "available": not re.search(r"\bagotado\b|sin stock", text, re.IGNORECASE),
@@ -278,6 +389,7 @@ def parse_tiendanube(html_text, base):
 
 
 def scan_html_store(base, cfg):
+    product_path = cfg.get("product_path", "/productos/")
     found = {}
     for path, only_title in cfg["paths"]:
         seen = set()
@@ -287,61 +399,38 @@ def scan_html_store(base, cfg):
             if r.status_code == 404 and page > 1:
                 break
             r.raise_for_status()
-            items = parse_tiendanube(r.text, base)
+            items = parse_html_listing(r.text, base, product_path)
             new = [sl for sl in items if sl not in seen]
             if not new:
                 break
             seen.update(new)
             for sl in new:
                 it = items[sl]
-                # se filtra solo por el título: el slug de Tiendanube lleva un sufijo aleatorio
-                # (ej. "-18o84") que podría confundirse con un código de carta
+                # se filtra solo por el título: el slug puede llevar sufijos aleatorios
                 if is_unwanted({"handle": "", "title": it["title"]}):
                     continue
                 if only_title and not TITLE_RE.search(it["title"]):
                     continue
-                found[f"{base}/productos/{sl}/"] = {
-                    "title": it["title"],
-                    "available": it["available"],
-                    "price": it["price"],
-                    "image": it["image"],
+                found[f"{base}{product_path}{sl}/"] = {
+                    **it,
                     "preorder": bool(PREVENTA_RE.search(path) or PREVENTA_RE.search(it["title"])),
                 }
             time.sleep(0.5)
-    print(f"{base}: {len(cfg['paths'])} categorías (HTML), {len(found)} productos")
+    print(f"{base}: HTML, {len(cfg['paths'])} categorías, {len(found)} productos")
     return found
 
 
-# --- Diagnóstico: detecta la plataforma de cada tienda y sus enlaces One Piece ----
-PLATFORM_MARKS = [
-    ("tiendanube", r"mitiendanube|nuvemshop|tiendanube"),
-    ("shopify", r"cdn\.shopify|myshopify"),
-    ("jumpseller", r"jumpseller"),
-    ("woocommerce", r"woocommerce|wp-content"),
-    ("magento", r"magento|mage-"),
-    ("prestashop", r"prestashop"),
-    ("wix", r"wixstatic"),
-    ("vtex", r"vtex"),
-    ("bsale", r"bsale"),
-]
-
-
-def diagnostico(urls):
-    for base in urls:
-        try:
-            r = requests.get(base, headers=HEADERS, timeout=30)
-        except Exception as e:  # noqa: BLE001
-            print(f"DIAG {base}: error {e}")
-            continue
-        page = r.text
-        plat = [n for n, pat in PLATFORM_MARKS if re.search(pat, page, re.IGNORECASE)]
-        hits = []
-        for href, label in re.findall(r'<a[^>]+href="([^"#]+)"[^>]*>(.*?)</a>', page, re.S | re.I):
-            label = re.sub(r"<[^>]+>|\s+", " ", label).strip()
-            if re.search(r"one[-\s]?piece|(^|[-/\s])op-?\d", href + " " + label, re.IGNORECASE):
-                if href not in [h for h, _ in hits]:
-                    hits.append((href, label[:50]))
-        print(f"DIAG {base}: HTTP {r.status_code} | plataforma={plat or '?'} | enlaces OP={hits[:10]}")
+# --- Orquestación ------------------------------------------------------------
+def scan_store(base):
+    """Devuelve {link: {title, available, price, image, preorder}} de la tienda."""
+    platform, detail = detect_platform(base)
+    if platform == "html":
+        return scan_html_store(base, HTML_STORES[base])
+    if platform == "shopify":
+        return scan_shopify(base)
+    if platform == "woocommerce":
+        return scan_woocommerce(base, detail)
+    raise UnsupportedStore(detail)
 
 
 def safe_scan(base):
@@ -349,6 +438,22 @@ def safe_scan(base):
         return base, scan_store(base), None
     except Exception as e:  # noqa: BLE001
         return base, None, e
+
+
+def diagnostico(urls):
+    for base in urls:
+        platform, detail = detect_platform(base)
+        hits = []
+        try:
+            page = requests.get(base, headers=HEADERS, timeout=30).text
+            for href, label in re.findall(r'<a[^>]+href="([^"#]+)"[^>]*>(.*?)</a>', page, re.S | re.I):
+                label = re.sub(r"<[^>]+>|\s+", " ", label).strip()
+                if re.search(r"one[-\s]?piece|(^|[-/\s])op-?\d|pre-?venta", href + " " + label, re.I):
+                    if href not in [h for h, _ in hits]:
+                        hits.append((href, label[:50]))
+        except requests.RequestException:
+            pass
+        print(f"DIAG {base}: {platform} {detail} | enlaces OP/preventa={hits[:10]}")
 
 
 def telegram(text, image=None):
@@ -383,9 +488,8 @@ def enviar_lista(results):
         total += len(en_stock)
         lines.append(f"\n<b>{html.escape(base.replace('https://', ''))}</b>")
         for link, p in sorted(en_stock, key=lambda x: x[1]["title"].lower()):
-            price = f"${p['price']:,.0f}".replace(",", ".")
             pre = " ⏳" if p["preorder"] else ""
-            lines.append(f'• <a href="{link}">{html.escape(p["title"])}</a> — {price}{pre}')
+            lines.append(f'• <a href="{link}">{html.escape(p["title"])}</a> — {fmt_price(p["price"])}{pre}')
     if not lines:
         telegram("📋 Ahora mismo no hay productos con stock en las tiendas vigiladas.")
         return
@@ -414,28 +518,39 @@ def main():
     if os.environ.get("DIAG", "").lower() == "true":
         diagnostico(STORES)
         return
+    if not TOKEN or not CHAT_ID:
+        sys.exit("Faltan TELEGRAM_TOKEN / TELEGRAM_CHAT_ID")
+
     first_run = not STATE_FILE.exists()
     old = {} if first_run else json.loads(STATE_FILE.read_text())
-    new, alerts, failed = {}, [], 0
+    new, alerts, failed, skipped = {}, [], 0, 0
 
     with ThreadPoolExecutor(max_workers=5) as pool:
         results = list(pool.map(safe_scan, STORES))
 
     for base, found, err in results:
+        prefix = base + "/"
         if err is not None:
-            print(f"ERROR {base}: {err}", file=sys.stderr)
-            failed += 1
-            new.update({k: v for k, v in old.items() if k.startswith(base + "/products/")})
+            if isinstance(err, UnsupportedStore):
+                print(f"SKIP {base}: {err} -> se omite (ver DIAG=true)")
+                skipped += 1
+            else:
+                print(f"ERROR {base}: {err}", file=sys.stderr)
+                failed += 1
+            # se conserva el estado anterior de la tienda para no re-alertar cuando vuelva
+            new.update({k: v for k, v in old.items() if k.startswith(prefix)})
             continue
+        # tienda nueva (o recién soportada): se registra en silencio, sin alertas masivas
+        store_first = first_run or not any(k.startswith(prefix) for k in old)
         for link, p in found.items():
             new[link] = p["available"]
-            if p["available"] and not old.get(link, False) and not first_run:
-                price = f"${p['price']:,.0f}".replace(",", ".")
+            if p["available"] and not old.get(link, False) and not store_first:
                 tag = "⏳ <b>Preventa</b>\n" if p["preorder"] else ""
                 alerts.append((
                     f"🟢 <b>{html.escape(p['title'])}</b>\n"
                     f"{tag}"
-                    f"Desde {price} CLP\n"
+                    + (f"Desde {fmt_price(p['price'])} CLP\n" if p["price"] is not None
+                       else "Precio: ver en la tienda\n") +
                     f'<a href="{link}">Ver producto</a>',
                     p["image"],
                 ))
@@ -444,17 +559,20 @@ def main():
         telegram(msg, image)
         time.sleep(1)
 
+    ok = len(STORES) - failed - skipped
+    print(f"Resumen: {ok} tiendas OK, {skipped} no soportadas, {failed} con error, {len(alerts)} alertas")
+
     if first_run:
         telegram(
             f"✅ Bot iniciado. Vigilando {len(new)} productos "
-            f"({sum(new.values())} con stock ahora) en {len(STORES) - failed} tiendas."
+            f"({sum(new.values())} con stock ahora) en {ok} tiendas."
         )
 
     if os.environ.get("LISTAR", "").lower() == "true":
         enviar_lista(results)
 
     STATE_FILE.write_text(json.dumps(new, indent=1, sort_keys=True))
-    sys.exit(1 if failed == len(STORES) else 0)
+    sys.exit(1 if ok == 0 else 0)
 
 
 if __name__ == "__main__":
