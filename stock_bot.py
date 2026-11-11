@@ -4,7 +4,8 @@ Bot de stock -> Telegram (autodescubre colecciones de One Piece y preventas).
 Para cada tienda detecta la plataforma automáticamente:
   - Shopify      -> /collections.json + /products.json
   - WooCommerce  -> Store API pública (/wp-json/wc/store/v1/...)
-  - HTML_STORES  -> lectura del HTML de categorías (Tiendanube, Bsale, etc.)
+  - HTML_STORES  -> lectura del HTML de categorías, según HTML_PRESETS
+                    (Tiendanube, Bsale, Jumpseller, WooCommerce sin API, PrestaShop)
   - Otra / bloqueada -> se omite con un aviso (no rompe el run ni borra su estado)
 
 En cada tienda vigila:
@@ -23,7 +24,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -59,18 +60,51 @@ STORES = [
 ]
 STORES = list(dict.fromkeys(s.strip().rstrip("/") for s in STORES if s.strip()))
 
+# Cómo reconocer un producto en el HTML de cada plataforma
+#   product_re:    regex sobre la ruta del link; el grupo 1 identifica al producto
+#   page_param:    parámetro de paginación de la plataforma
+#   require_price: solo cuenta como producto si su tarjeta muestra un precio
+#                  (Jumpseller no usa prefijo en sus URLs; sin esto, el menú parecería producto)
+#   trailing_slash: el link guardado termina en "/" (mantiene compatible el state.json de File City)
+HTML_PRESETS = {
+    "tiendanube": {"product_re": r"^/productos/([^/?#]+)", "page_param": "page", "trailing_slash": True},
+    "bsale": {"product_re": r"^/product/([^/?#]+)", "page_param": "page"},
+    "jumpseller": {"product_re": r"^/([a-z0-9][a-z0-9-]*)/?$", "page_param": "page", "require_price": True},
+    "woocommerce": {"product_re": r"^/(?:producto|product)/([^/?#]+)", "page_param": "paged"},
+    "prestashop": {"product_re": r"/(\d+-[^/?#]+)\.html$", "page_param": "page"},
+}
+
 # Tiendas que se leen desde el HTML de sus categorías (no tienen API pública).
-#   product_path: prefijo de la URL de cada producto en esa plataforma
-#       Tiendanube -> "/productos/"   |   Bsale -> "/product/"
+#   platform: una de HTML_PRESETS
 #   paths: (ruta_categoria, solo_titulos_one_piece)
 #       False = toda la categoría es One Piece | True = categoría mezclada (preventas)
 HTML_STORES = {
     "https://filecity.cl": {
-        "product_path": "/productos/",
+        "platform": "tiendanube",
         "paths": [
             ("/one-piece-card-game/", False),
             ("/pre-ventas1/", True),
         ],
+    },
+    "https://mrloc.cl": {
+        "platform": "jumpseller",
+        "paths": [("/one-piece-tcg", False)],
+    },
+    "https://elreinodelosduelos.cl": {
+        "platform": "woocommerce",
+        "paths": [("/categoria-producto/one-piece-card-game/", False)],
+    },
+    "https://thirdimpact.cl": {
+        "platform": "bsale",
+        "paths": [("/collection/one-piece-card-game", False)],
+    },
+    "https://oneupstore.cl": {
+        "platform": "bsale",
+        "paths": [("/collection/one-piece", False)],
+    },
+    "https://royalcardstore.cl": {
+        "platform": "prestashop",
+        "paths": [("/es/busqueda?controller=search&s=One+piece", False)],
     },
 }
 
@@ -122,8 +156,11 @@ UNWANTED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# (incluye productos de Bandai que algunas tiendas publican sin decir "One Piece",
+#  p. ej. "Illustration Box Vol. 7" o "Double Pack Set Vol.12")
 ONE_PIECE_RE = re.compile(
-    r"one[-\s]?piece|(^|-)op-|(^|[^a-z])(op|eb|prb|st|ib|dp|ts|sd|ln|lt|df|peb)-?\d{1,2}([^0-9a-z]|$)",
+    r"one[-\s]?piece|illustration[-\s]box|double[-\s]pack[-\s]set|devil[-\s]fruits[-\s]collection|"
+    r"(^|-)op-|(^|[^a-z])(op|eb|prb|st|ib|dp|ts|sd|ln|lt|df|peb)-?\d{1,2}([^0-9a-z]|$)",
     re.IGNORECASE,
 )
 
@@ -163,10 +200,10 @@ PLATFORM_MARKS = [
     ("jumpseller", r"jumpseller"),
     ("woocommerce", r"woocommerce|wp-content"),
     ("bsale", r"bsale"),
-    ("magento", r"magento|mage-"),
+    ("magento", r"magento"),          # antes "mage-" coincidía con "image-" (falso positivo)
     ("prestashop", r"prestashop"),
     ("wix", r"wixstatic"),
-    ("vtex", r"vtex"),
+    ("vtex", r"vtexassets|vtex\.com"),
 ]
 WOO_APIS = ("/wp-json/wc/store/v1", "/wp-json/wc/store")
 
@@ -320,103 +357,159 @@ def scan_woocommerce(base, api):
     return found
 
 
-# --- Tiendas leídas desde HTML (Tiendanube, Bsale...) ---------------------------
-def _slug_of(a, product_path):
-    m = re.search(re.escape(product_path) + r"([^/?#]+)", a.get("href") or "")
-    return m.group(1) if m else None
+# --- Tiendas leídas desde HTML (Tiendanube, Bsale, Jumpseller, WooCommerce, PrestaShop) ---
+OUT_OF_STOCK_RE = re.compile(
+    r"\bagotado\b|sin stock|fuera de stock|out of stock|no disponible", re.IGNORECASE)
+OUT_OF_STOCK_CSS = '[class*="outofstock"], [class*="out-of-stock"], [class*="out_of_stock"]'
+# "$19.990" / "$ 6990" / "19.990 $" (el formato con $ al final exige separador de miles,
+# para no confundir "Vol. 7 $35.990" con un precio de $7)
+PRICE_RE = re.compile(r"\$\s?(\d{1,3}(?:\.\d{3})+|\d+)|(?<![\d.])(\d{1,3}(?:\.\d{3})+)\s?\$")
+
+
+def _host(url):
+    host = urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
 
 
 def _price_clp(text):
-    vals = [int(x.replace(".", "")) for x in re.findall(r"\$\s?(\d{1,3}(?:\.\d{3})+|\d+)", text)]
-    vals = [v for v in vals if v > 0]
+    vals = [int((a or b).replace(".", "")) for a, b in PRICE_RE.findall(text)]
+    vals = [v for v in vals if v >= 100]          # descarta $0 del carrito y números sueltos
     return min(vals) if vals else None
 
 
-def _img_url(card, base):
+def _img_url(card, page_url):
     img = card.find("img")
     if not img:
         return None
-    for attr in ("data-srcset", "srcset", "data-src", "src"):
+    for attr in ("data-srcset", "srcset", "data-src", "data-lazy-src", "src"):
         val = img.get(attr)
         if not val:
             continue
         url = val.split(",")[0].strip().split(" ")[0]
         if url.startswith("data:"):
             continue
-        if url.startswith("//"):
-            return "https:" + url
-        if url.startswith("/"):
-            return base + url
-        return url
+        return urljoin(page_url, url)
     return None
 
 
-def parse_html_listing(html_text, base, product_path):
-    """Devuelve {slug: {title, available, price, image}} de una página de categoría."""
+def _make_matcher(page_url, product_re, skip_paths):
+    """Devuelve una función: <a> -> (id_producto, ruta) o None."""
+    host = _host(page_url)
+
+    def match(a):
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            return None
+        u = urlparse(urljoin(page_url, href))
+        if _host(u.geturl()) != host or u.path.rstrip("/") in skip_paths:
+            return None
+        m = product_re.search(u.path)
+        return (m.group(1), u.path) if m else None
+    return match
+
+
+def _card_title(card, anchors):
+    title = next((a["title"].strip() for a in anchors if a.get("title", "").strip()), "")
+    if not title:
+        h = card.find(["h2", "h3", "h4", "h5"])
+        title = h.get_text(" ", strip=True) if h else ""
+    if not title:
+        img = card.find("img", alt=True)
+        title = img["alt"].strip() if img else ""
+    if not title:
+        title = max((a.get_text(" ", strip=True) for a in anchors), key=len, default="")
+    return title
+
+
+def parse_html_listing(html_text, page_url, product_re, skip_paths, require_price=False):
+    """Devuelve {id: {title, path, available, price, image}} de una página de categoría."""
     try:
         from bs4 import BeautifulSoup
     except ImportError as e:
         raise RuntimeError("falta beautifulsoup4 (pip install beautifulsoup4)") from e
     soup = BeautifulSoup(html_text, "html.parser")
+    match = _make_matcher(page_url, product_re, skip_paths)
     items = {}
     for a in soup.find_all("a", href=True):
-        slug = _slug_of(a, product_path)
-        if not slug or slug in items:
+        hit = match(a)
+        if not hit or hit[0] in items:
             continue
+        pid, path = hit
         # la "tarjeta" es el elemento más grande que contiene solo este producto
         card, levels = a, 0
         while card.parent is not None and card.parent.name not in ("body", "html", "[document]") and levels < 8:
-            slugs = {_slug_of(x, product_path) for x in card.parent.find_all("a", href=True)} - {None}
-            if len(slugs) > 1:
+            ids = {h[0] for h in map(match, card.parent.find_all("a", href=True)) if h}
+            if len(ids) > 1:
                 break
             card, levels = card.parent, levels + 1
         text = card.get_text(" ", strip=True)
-        title = next((x["title"] for x in card.find_all("a", href=True)
-                      if _slug_of(x, product_path) == slug and x.get("title")), "")
-        if not title:
-            img = card.find("img", alt=True)
-            title = (img["alt"] if img and img["alt"] else "").strip()
-        if not title:
-            title = max((x.get_text(" ", strip=True) for x in card.find_all("a", href=True)
-                         if _slug_of(x, product_path) == slug), key=len, default=slug)
-        items[slug] = {
-            "title": title,
-            "available": not re.search(r"\bagotado\b|sin stock", text, re.IGNORECASE),
-            "price": _price_clp(text),
-            "image": _img_url(card, base),
+        price = _price_clp(text)
+        if require_price and price is None:
+            continue                     # link de menú/categoría, no un producto
+        anchors = [x for x in card.find_all("a", href=True) if (match(x) or (None,))[0] == pid]
+        classes = " ".join(card.get("class") or [])
+        out = bool(OUT_OF_STOCK_RE.search(text) or re.search(r"out.?of.?stock", classes)
+                   or card.select_one(OUT_OF_STOCK_CSS))
+        items[pid] = {
+            "title": _card_title(card, anchors) or pid,
+            "path": path,
+            "available": not out,
+            "price": price,
+            "image": _img_url(card, page_url),
         }
     return items
 
 
+def _debug_links(base, r, limit=12):
+    """Si una categoría no entrega productos, muestra qué links internos tiene (para ajustar)."""
+    hrefs = re.findall(r'href=["\']([^"\'#]+)', r.text)
+    internal = []
+    for h in hrefs:
+        u = urljoin(r.url, h)
+        if _host(u) == _host(r.url) and u not in internal:
+            internal.append(u)
+    print(f"DEBUG {base}: HTTP {r.status_code} url={r.url} | {len(internal)} links internos, "
+          f"ejemplos: {internal[:limit]}")
+
+
 def scan_html_store(base, cfg):
-    product_path = cfg.get("product_path", "/productos/")
+    preset = {**HTML_PRESETS[cfg.get("platform", "tiendanube")], **cfg}
+    product_re = re.compile(preset["product_re"], re.IGNORECASE)
+    skip_paths = {""} | {urlparse(p).path.rstrip("/") for p, _ in cfg["paths"]}
     found = {}
     for path, only_title in cfg["paths"]:
         seen = set()
         for page in range(1, 11):
-            r = requests.get(base + path, params={"page": page} if page > 1 else None,
-                             headers=HEADERS, timeout=30)
+            params = {preset["page_param"]: page} if page > 1 else None
+            r = requests.get(base + path, params=params, headers=HEADERS, timeout=30)
             if r.status_code == 404 and page > 1:
                 break
             r.raise_for_status()
-            items = parse_html_listing(r.text, base, product_path)
-            new = [sl for sl in items if sl not in seen]
+            items = parse_html_listing(r.text, r.url, product_re, skip_paths, preset.get("require_price"))
+            if page == 1 and not items:
+                _debug_links(base, r)
+            new = [pid for pid in items if pid not in seen]
             if not new:
                 break
             seen.update(new)
-            for sl in new:
-                it = items[sl]
+            for pid in new:
+                it = items.pop(pid)
                 # se filtra solo por el título: el slug puede llevar sufijos aleatorios
                 if is_unwanted({"handle": "", "title": it["title"]}):
                     continue
                 if only_title and not TITLE_RE.search(it["title"]):
                     continue
-                found[f"{base}{product_path}{sl}/"] = {
+                link_path = it.pop("path")
+                if preset.get("trailing_slash"):
+                    link_path = link_path.rstrip("/") + "/"
+                found[base + link_path] = {
                     **it,
-                    "preorder": bool(PREVENTA_RE.search(path) or PREVENTA_RE.search(it["title"])),
+                    "preorder": bool(PREVENTA_RE.search(path) or PREVENTA_RE.search(it["title"])
+                                     or PREVENTA_RE.search(link_path)),
                 }
             time.sleep(0.5)
-    print(f"{base}: HTML, {len(cfg['paths'])} categorías, {len(found)} productos")
+    print(f"{base}: HTML/{cfg.get('platform', 'tiendanube')}, {len(cfg['paths'])} categorías, "
+          f"{len(found)} productos")
     return found
 
 
