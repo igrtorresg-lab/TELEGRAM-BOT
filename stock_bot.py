@@ -54,6 +54,7 @@ STORES = [
     "https://progaming.cl",
     "https://bastiongoblin.com",
     "https://tecitogames.com",
+    "https://pokedals.cl",
     "https://tablecatgames.cl",
     "https://dyskeu.cl",
     "https://cardhousegaming.com",
