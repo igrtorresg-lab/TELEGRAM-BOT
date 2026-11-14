@@ -42,6 +42,7 @@ STORES = [
     "https://metagaming.cl",
     "https://filecity.cl",
     "https://mrloc.cl",
+    "https://clubdelgoblin.com",
     "https://elreinodelosduelos.cl",
     "https://tcglifestore.cl",
     "https://thirdimpact.cl",
