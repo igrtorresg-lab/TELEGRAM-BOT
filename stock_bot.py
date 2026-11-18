@@ -130,9 +130,33 @@ HTML_STORES = {
         "platform": "bsale",
         "paths": [("/collection/one-piece", False)],
     },
+    # Royal: se usa la versión /cl/ del sitio (la /es/ le llegaba vacía al bot).
+    # La portada (True = solo títulos One Piece) es respaldo si la búsqueda falla.
     "https://royalcardstore.cl": {
         "platform": "prestashop",
-        "paths": [("/es/busqueda?controller=search&s=One+piece", False)],
+        "paths": [
+            ("/cl/busqueda?controller=search&s=One+piece", False),
+            ("/cl/", True),
+        ],
+    },
+    "https://www.wargaming.cl": {
+        "platform": "bsale",
+        "paths": [
+            ("/collection/onepiece", False),
+            ("/collection/00_pre-order_onepiece", False),
+        ],
+    },
+    # TCG Lab (Jumpseller) no tiene categoría de sellado: se usan búsquedas de producto
+    # sellado. Las cartas sueltas se descartan con los filtros de siempre.
+    "https://tcglab.cl": {
+        "platform": "jumpseller",
+        "max_pages": 3,
+        "paths": [
+            ("/search/booster", False),
+            ("/search/starter-deck", False),
+            ("/search/double-pack", False),
+            ("/search/illustration-box", False),
+        ],
     },
 }
 
@@ -390,7 +414,7 @@ def scan_woocommerce(base, api):
 
 # --- Tiendas leídas desde HTML (Tiendanube, Bsale, Jumpseller, WooCommerce, PrestaShop) ---
 OUT_OF_STOCK_RE = re.compile(
-    r"\bagotado\b|sin stock|fuera de stock|out of stock|no disponible", re.IGNORECASE)
+    r"\bagotado\b|sin stock|fuera de stock|out[-\s]of[-\s]stock|no disponible", re.IGNORECASE)
 OUT_OF_STOCK_CSS = '[class*="outofstock"], [class*="out-of-stock"], [class*="out_of_stock"]'
 # "$19.990" / "$ 6990" / "19.990 $" (el formato con $ al final exige separador de miles,
 # para no confundir "Vol. 7 $35.990" con un precio de $7)
@@ -449,6 +473,12 @@ def _card_title(card, anchors):
         title = img["alt"].strip() if img else ""
     if not title:
         title = max((a.get_text(" ", strip=True) for a in anchors), key=len, default="")
+    # algunas tiendas (PrestaShop) recortan el título: "One Piece Card Game: The..."
+    if title.endswith(("...", "…")):
+        img = card.find("img", alt=True)
+        alt = img["alt"].strip() if img else ""
+        if len(alt) > len(title.rstrip(".… ")):
+            title = alt
     return title
 
 
@@ -499,8 +529,10 @@ def _debug_links(base, r, limit=12):
         u = urljoin(r.url, h)
         if _host(u) == _host(r.url) and u not in internal:
             internal.append(u)
-    print(f"DEBUG {base}: HTTP {r.status_code} url={r.url} | {len(internal)} links internos, "
-          f"ejemplos: {internal[:limit]}")
+    m = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.S | re.I)
+    title = re.sub(r"\s+", " ", m.group(1)).strip()[:60] if m else "-"
+    print(f"DEBUG {base}: HTTP {r.status_code} url={r.url} | {len(r.text)} bytes, título='{title}' | "
+          f"{len(internal)} links internos, ejemplos: {internal[:limit]}")
 
 
 def scan_html_store(base, cfg):
@@ -510,7 +542,7 @@ def scan_html_store(base, cfg):
     found = {}
     for path, only_title in cfg["paths"]:
         seen = set()
-        for page in range(1, 11):
+        for page in range(1, preset.get("max_pages", 10) + 1):
             params = {preset["page_param"]: page} if page > 1 else None
             r = fetch(base + path, params=params)
             if r.status_code == 404 and page > 1:
@@ -545,6 +577,9 @@ def scan_html_store(base, cfg):
 
 
 # --- Autodetección de categorías (tiendas HTML que no están en HTML_STORES) ----
+# Categorías por rareza de carta suelta: /one-piece/l, /r, /sr, /sec, /uc, /sp...
+RARITY_PATH_RE = re.compile(r"/(l|c|uc|r|sr|sec|sp|spr|p|tr|alt|leader|common|rare)/?$", re.IGNORECASE)
+
 def auto_html_store(base, platform):
     if platform == "prestashop":
         raise UnsupportedStore("prestashop: agrega su búsqueda/categoría en HTML_STORES")
@@ -575,7 +610,7 @@ def auto_html_store(base, platform):
         if platform == "jumpseller" and len(label) > 30:     # en Jumpseller productos y categorías comparten URL
             continue
         text = f"{path} {label}"
-        if SINGLES_RE.search(text):
+        if SINGLES_RE.search(text) or RARITY_PATH_RE.search(path):
             continue
         if COLLECTION_RE.search(text):
             cands[path] = False
@@ -605,10 +640,13 @@ def scan_store(base):
 
 
 def safe_scan(base):
+    t0 = time.monotonic()
     try:
         return base, scan_store(base), None
     except Exception as e:  # noqa: BLE001
         return base, None, e
+    finally:
+        print(f"TIEMPO {base}: {time.monotonic() - t0:.1f}s")
 
 
 def diagnostico(urls):
@@ -628,21 +666,33 @@ def diagnostico(urls):
 
 
 # --- Telegram (envía a TODOS los chats de TELEGRAM_CHAT_ID) -------------------
+def _tg_post(method, payload):
+    """POST a Telegram. Si responde 429 (límite: ~20 msg/min por grupo), espera lo que
+    indica `retry_after` y reintenta una vez."""
+    url = f"https://api.telegram.org/bot{TOKEN}/{method}"
+    r = requests.post(url, json=payload, timeout=30)
+    if r.status_code == 429:
+        try:
+            wait = int(r.json().get("parameters", {}).get("retry_after", 5))
+        except ValueError:
+            wait = 5
+        print(f"Telegram 429 para {payload.get('chat_id')}: espero {wait}s y reintento")
+        time.sleep(min(wait, 60) + 1)
+        r = requests.post(url, json=payload, timeout=30)
+    return r
+
+
 def _send_one(chat, text, image=None, no_preview=False):
     """Envía un mensaje a un chat. Con foto si se puede; si falla la foto, solo texto."""
     if image:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
-            json={"chat_id": chat, "photo": image, "caption": text, "parse_mode": "HTML"},
-            timeout=30,
-        )
+        r = _tg_post("sendPhoto", {"chat_id": chat, "photo": image, "caption": text, "parse_mode": "HTML"})
         if r.ok:
             return
         print(f"sendPhoto falló para {chat}, envío solo texto:", r.status_code, r.text)
     payload = {"chat_id": chat, "text": text, "parse_mode": "HTML"}
     if no_preview:
         payload["disable_web_page_preview"] = True
-    r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json=payload, timeout=30)
+    r = _tg_post("sendMessage", payload)
     if not r.ok:
         print("Telegram error:", chat, r.status_code, r.text)
     r.raise_for_status()
