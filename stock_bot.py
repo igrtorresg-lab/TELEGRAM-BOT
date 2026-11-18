@@ -58,6 +58,8 @@ STORES = [
     "https://pokedals.cl",
     "https://tablecatgames.cl",
     "https://dyskeu.cl",
+    "https://tcglab.cl/",
+    "https://www.wargaming.cl/",
     "https://cardhousegaming.com",
 ]
 STORES = list(dict.fromkeys(s.strip().rstrip("/") for s in STORES if s.strip()))
