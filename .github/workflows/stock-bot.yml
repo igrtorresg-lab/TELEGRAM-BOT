@@ -2,7 +2,7 @@ name: stock-bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       listar:
@@ -11,6 +11,10 @@ on:
         default: false
       diagnostico:
         description: "Solo diagnóstico: detectar la plataforma de cada tienda (no envía avisos)"
+        type: boolean
+        default: false
+      probar_telegram:
+        description: "Solo probar Telegram: envía un mensaje de prueba a cada chat"
         type: boolean
         default: false
 
@@ -35,11 +39,23 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LISTAR: ${{ inputs.listar }}
           DIAG: ${{ inputs.diagnostico }}
+          TEST_TG: ${{ inputs.probar_telegram }}
         run: python stock_bot.py
       - name: Guardar estado
         if: always()
         run: |
+          [ -f state.json ] || exit 0
+          cp state.json /tmp/state.json
           git config user.name "stock-bot"
           git config user.email "stock-bot@users.noreply.github.com"
-          git add state.json
-          git diff --cached --quiet || (git commit -m "update state" && git push)
+          for i in 1 2 3; do
+            git fetch origin main
+            git reset --hard origin/main
+            cp /tmp/state.json state.json
+            git add state.json
+            git diff --cached --quiet && exit 0
+            git commit -m "update state"
+            git push origin HEAD:main && exit 0
+            sleep 5
+          done
+          exit 1
