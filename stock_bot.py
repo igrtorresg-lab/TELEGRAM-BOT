@@ -14,6 +14,8 @@ En cada tienda vigila:
 y te avisa por Telegram, con foto y link, cuando uno pasa a tener stock.
 
 Variables de entorno requeridas: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+  TELEGRAM_CHAT_ID admite VARIOS chats separados por coma (tú, un grupo, un amigo):
+  por ejemplo  -5415617768,7544062179
 Opcionales: DIAG=true (solo diagnóstico de plataformas), LISTAR=true (envía la lista con stock)
 """
 import html
@@ -30,8 +32,31 @@ import requests
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Varios chats separados por coma: "-5415617768,7544062179"
+CHAT_IDS = [c.strip() for c in CHAT_ID.split(",") if c.strip()]
 STATE_FILE = Path("state.json")
-HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-CL,es;q=0.9,en;q=0.5",
+}
+
+
+def fetch(url, params=None, timeout=30, tries=3):
+    """GET con reintentos: cortes de conexión (IncompleteRead) y errores 429/5xx suelen ser pasajeros."""
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+            if r.status_code in (429, 500, 502, 503, 504) and i < tries - 1:
+                time.sleep(3 * (i + 1))
+                continue
+            return r
+        except requests.RequestException as e:   # incluye ChunkedEncodingError, Timeout, ConnectionError
+            last = e
+            if i < tries - 1:
+                time.sleep(3 * (i + 1))
+    raise last
 
 # --- Tiendas (una por línea, SIEMPRE con coma al final) -------------------
 # Da igual si terminan en "/" o si se repiten: se normalizan abajo.
@@ -49,7 +74,6 @@ STORES = [
     "https://royalcardstore.cl",
     "https://deckkingdom.cl",
     "https://piedrabruja.cl",
-    "https://mirax.cl",
     "https://oneupstore.cl",
     "https://metagame.cl",
     "https://progaming.cl",
@@ -58,9 +82,9 @@ STORES = [
     "https://pokedals.cl",
     "https://tablecatgames.cl",
     "https://dyskeu.cl",
-    "https://tcglab.cl/",
-    "https://www.wargaming.cl/",
     "https://cardhousegaming.com",
+    "https://tcglab.cl",
+    "https://www.wargaming.cl",
 ]
 STORES = list(dict.fromkeys(s.strip().rstrip("/") for s in STORES if s.strip()))
 
@@ -188,7 +212,7 @@ def is_unwanted(p):
 
 
 def get_json(url, **params):
-    r = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    r = fetch(url, params=params)
     r.raise_for_status()
     return r.json()
 
@@ -215,7 +239,7 @@ WOO_APIS = ("/wp-json/wc/store/v1", "/wp-json/wc/store")
 def _probe_json(url, key=None, **params):
     """Devuelve el JSON si la URL responde JSON válido (y trae `key`), si no None."""
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+        r = fetch(url, params=params, timeout=20, tries=2)
         if r.status_code != 200:
             return None
         data = r.json()
@@ -236,12 +260,15 @@ def detect_platform(base):
         if isinstance(_probe_json(f"{base}{api}/products", per_page=1), list):
             return "woocommerce", api
     try:
-        r = requests.get(base, headers=HEADERS, timeout=20)
+        r = fetch(base, timeout=20)
     except requests.RequestException as e:
         return "otra", f"sin conexión ({type(e).__name__})"
     if r.status_code in (401, 403, 429, 503):
         return "otra", f"bloquea al bot (HTTP {r.status_code})"
     marks = [n for n, pat in PLATFORM_MARKS if re.search(pat, r.text, re.IGNORECASE)]
+    for name in marks:
+        if name in HTML_PRESETS:       # plataforma que sabemos leer desde el HTML: se autodetectan sus categorías
+            return f"auto:{name}", ""
     return "otra", f"plataforma={marks or '?'} (HTTP {r.status_code})"
 
 
@@ -485,7 +512,7 @@ def scan_html_store(base, cfg):
         seen = set()
         for page in range(1, 11):
             params = {preset["page_param"]: page} if page > 1 else None
-            r = requests.get(base + path, params=params, headers=HEADERS, timeout=30)
+            r = fetch(base + path, params=params)
             if r.status_code == 404 and page > 1:
                 break
             r.raise_for_status()
@@ -517,6 +544,51 @@ def scan_html_store(base, cfg):
     return found
 
 
+# --- Autodetección de categorías (tiendas HTML que no están en HTML_STORES) ----
+def auto_html_store(base, platform):
+    if platform == "prestashop":
+        raise UnsupportedStore("prestashop: agrega su búsqueda/categoría en HTML_STORES")
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as e:
+        raise RuntimeError("falta beautifulsoup4 (pip install beautifulsoup4)") from e
+    r = fetch(base)
+    r.raise_for_status()
+    product_re = re.compile(HTML_PRESETS[platform]["product_re"], re.IGNORECASE)
+    host = _host(r.url)
+    cands = {}
+    for a in BeautifulSoup(r.text, "html.parser").find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        u = urlparse(urljoin(r.url, href))
+        path = u.path
+        if _host(u.geturl()) != host or path in ("", "/"):
+            continue
+        label = f"{a.get_text(' ', strip=True)} {a.get('title') or ''}".strip()
+        if platform == "bsale" and not path.startswith("/collection/"):
+            continue
+        if platform == "woocommerce" and not re.search(r"categoria-producto|product-category", path):
+            continue
+        if platform == "tiendanube" and product_re.search(path):
+            continue
+        if platform == "jumpseller" and len(label) > 30:     # en Jumpseller productos y categorías comparten URL
+            continue
+        text = f"{path} {label}"
+        if SINGLES_RE.search(text):
+            continue
+        if COLLECTION_RE.search(text):
+            cands[path] = False
+        elif PREVENTA_RE.search(text):
+            cands.setdefault(path, True)
+    paths = sorted(cands.items(), key=lambda kv: (kv[1], len(kv[0])))[:6]   # primero las de One Piece
+    if not paths:
+        raise UnsupportedStore(f"{platform}: no encontré categorías de One Piece en el menú "
+                               f"(agrégala a mano en HTML_STORES)")
+    print(f"{base}: categorías detectadas automáticamente ({platform}): {[p for p, _ in paths]}")
+    return scan_html_store(base, {"platform": platform, "paths": paths})
+
+
 # --- Orquestación ------------------------------------------------------------
 def scan_store(base):
     """Devuelve {link: {title, available, price, image, preorder}} de la tienda."""
@@ -527,6 +599,8 @@ def scan_store(base):
         return scan_shopify(base)
     if platform == "woocommerce":
         return scan_woocommerce(base, detail)
+    if platform.startswith("auto:"):
+        return auto_html_store(base, platform.split(":", 1)[1])
     raise UnsupportedStore(detail)
 
 
@@ -553,24 +627,54 @@ def diagnostico(urls):
         print(f"DIAG {base}: {platform} {detail} | enlaces OP/preventa={hits[:10]}")
 
 
-def telegram(text, image=None):
+# --- Telegram (envía a TODOS los chats de TELEGRAM_CHAT_ID) -------------------
+def _send_one(chat, text, image=None, no_preview=False):
+    """Envía un mensaje a un chat. Con foto si se puede; si falla la foto, solo texto."""
     if image:
         r = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
-            json={"chat_id": CHAT_ID, "photo": image, "caption": text, "parse_mode": "HTML"},
+            json={"chat_id": chat, "photo": image, "caption": text, "parse_mode": "HTML"},
             timeout=30,
         )
         if r.ok:
             return
-        print("sendPhoto falló, envío solo texto:", r.status_code, r.text)
-    r = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
-        timeout=30,
-    )
+        print(f"sendPhoto falló para {chat}, envío solo texto:", r.status_code, r.text)
+    payload = {"chat_id": chat, "text": text, "parse_mode": "HTML"}
+    if no_preview:
+        payload["disable_web_page_preview"] = True
+    r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json=payload, timeout=30)
     if not r.ok:
-        print("Telegram error:", r.status_code, r.text)
+        print("Telegram error:", chat, r.status_code, r.text)
     r.raise_for_status()
+
+
+def telegram(text, image=None, no_preview=False):
+    """Envía a cada chat de CHAT_IDS. Si uno falla (p. ej. alguien no pulsó Start),
+    sigue con los demás; solo lanza error si no llegó a ninguno."""
+    ok, last = False, None
+    for chat in CHAT_IDS:
+        try:
+            _send_one(chat, text, image, no_preview)
+            ok = True
+        except Exception as e:  # noqa: BLE001
+            print(f"No se pudo enviar al chat {chat}: {e}", file=sys.stderr)
+            last = e
+    if not ok and last:
+        raise last
+
+
+def probar_telegram():
+    """Envía un mensaje de prueba a cada chat y dice cuál falla y por qué."""
+    print(f"Telegram: {len(CHAT_IDS)} chat(s) configurado(s) en TELEGRAM_CHAT_ID")
+    for i, chat in enumerate(CHAT_IDS, 1):
+        try:
+            _send_one(chat, "🔔 Prueba del bot de stock: si lees esto, este chat está bien configurado.")
+            print(f"  chat #{i}: OK")
+        except Exception as e:  # noqa: BLE001
+            print(f"  chat #{i}: FALLÓ -> {e}")
+    if len(CHAT_IDS) < 2:
+        print("  (si esperabas 2 chats: el secreto TELEGRAM_CHAT_ID tiene solo 1; "
+              "formato: -5415617768,7544062179)")
 
 
 def enviar_lista(results):
@@ -599,15 +703,7 @@ def enviar_lista(results):
         cur += "\n" + line
     messages.append(cur)
     for m in messages:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": m, "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=30,
-        )
-        if not r.ok:
-            print("Telegram error:", r.status_code, r.text)
-        r.raise_for_status()
+        telegram(m, no_preview=True)
         time.sleep(1)
 
 
@@ -615,8 +711,12 @@ def main():
     if os.environ.get("DIAG", "").lower() == "true":
         diagnostico(STORES)
         return
-    if not TOKEN or not CHAT_ID:
+    if not TOKEN or not CHAT_IDS:
         sys.exit("Faltan TELEGRAM_TOKEN / TELEGRAM_CHAT_ID")
+    if os.environ.get("TEST_TG", "").lower() == "true":
+        probar_telegram()
+        return
+    print(f"Telegram: se enviará a {len(CHAT_IDS)} chat(s)")
 
     first_run = not STATE_FILE.exists()
     old = {} if first_run else json.loads(STATE_FILE.read_text())
