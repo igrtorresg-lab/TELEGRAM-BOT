@@ -221,11 +221,44 @@ ACCESSORY_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Carta promo SUELTA que viene de una Premium Card Collection:
-#   handle "izo-premium-card-collection-film-red" o título "Izo (Premium Card Collection ...)"
-PROMO_SINGLE_HANDLE_RE = re.compile(
-    r"^(?!(one|live|premium|preventa|pre|pack|caja|box|set)-)[a-z]+(-[a-z]+)?-premium-card-collection")
-PROMO_SINGLE_TITLE_RE = re.compile(r"^[^()]{1,40}\(\s*premium[-\s]card[-\s]collection", re.IGNORECASE)
+# --- Cartas sueltas que mencionan "Premium Card Collection" -------------------
+# Regla 1: ANTES del nombre solo pueden ir palabras "de producto" (One Piece, Bandai,
+#          Preventa, Carpeta...). Si va otra cosa, es un personaje:
+#          "Izo - Premium Card Collection..."  /  "Nami [Premium Card Collection]"
+# Regla 2: DESPUÉS debe venir algo de producto sellado: "Vol.", "Edition", "Selection",
+#          un subtítulo estilo Bandai "-Uta-", o nada. Si solo viene un nombre, es carta:
+#          "Premium Card Collection Izo"  /  "Premium Card Collection - Nami"
+PCC_RE = re.compile(r"premium[-\s]card[-\s]collection", re.IGNORECASE)
+PCC_PREFIX_OK = {
+    "one", "piece", "onepiece", "card", "game", "cardgame", "tcg", "bandai", "oficial", "official",
+    "preventa", "pre", "venta", "preorder", "order", "reserva", "nuevo", "new", "sellado",
+    "live", "action", "carpeta", "coleccion", "colección", "producto", "op",
+}
+PCC_SEALED_RE = re.compile(
+    r"vol|volume|edition|edici[oó]n|selection|selecci[oó]n|\bbest\b|\bset\b|\bbox\b|caja|"
+    r"carpeta|binder|[aá]lbum|\b(19|20)\d{2}\b|\b\d+(st|nd|rd|th)\b",
+    re.IGNORECASE,
+)
+BANDAI_SUBTITLE_RE = re.compile(r"^\W*-\s*[^-]+?\s*-\W*$")   # "-Uta-"
+
+
+def is_pcc_single(text):
+    """True si `text` (título o handle) es una carta suelta de una Premium Card Collection."""
+    t = text.lower().replace("_", " ")
+    m = PCC_RE.search(t)
+    if not m:
+        return False
+    before, after = t[:m.start()], t[m.end():]
+    words = re.findall(r"[a-z0-9áéíóúñ]+", before)
+    if any(w not in PCC_PREFIX_OK for w in words):
+        return True                                           # regla 1: hay un personaje antes
+    if not re.search(r"[a-z0-9]", after) or PCC_SEALED_RE.search(after) or BANDAI_SUBTITLE_RE.match(after):
+        return False                                          # regla 2: sellado
+    return True                                               # "Premium Card Collection Izo"
+
+
+# Rareza entre paréntesis o corchetes: "Luffy (SR)", "Nami [SEC]", "Uta (P)" -> carta suelta
+RARITY_TAG_RE = re.compile(r"[(\[]\s*(l|c|uc|r|sr|sec|sp|spr|p|tr|alt|aa|pr|promo)\s*[)\]]", re.IGNORECASE)
 
 UNWANTED_RE = re.compile(
     r"lego|paper[-\s]theater|tournament|prueba|inscripci[oó]n|(^|[-\s])cupos?([-\s]|$)|torneo|"
@@ -260,8 +293,12 @@ def is_unwanted(p):
     text = f"{handle} {p['title'].lower()}"
     if not ONE_PIECE_RE.search(text):
         return True                                  # no es de One Piece
-    if PROMO_SINGLE_HANDLE_RE.search(handle) or PROMO_SINGLE_TITLE_RE.search(p["title"]):
-        return True                                  # carta promo suelta de una Premium Card Collection
+    # carta suelta de una Premium Card Collection: se juzga por el título; el handle solo si
+    # el título no menciona la colección (los handles traen basura de la tienda)
+    if (is_pcc_single(p["title"]) if PCC_RE.search(p["title"]) else is_pcc_single(handle)):
+        return True
+    if RARITY_TAG_RE.search(p["title"]):
+        return True                                  # carta suelta con rareza: "Luffy (SR)"
     if ACCESSORY_RE.search(text) and not COLLECTION_PRODUCT_RE.search(text):
         return True                                  # accesorio genérico (carpeta, sleeves...)
     return bool(
