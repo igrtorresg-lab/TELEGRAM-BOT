@@ -85,6 +85,7 @@ STORES = [
     "https://cardhousegaming.com",
     "https://tcglab.cl",
     "https://www.wargaming.cl",
+    "https://www.gomerrycards.cl",
 ]
 STORES = list(dict.fromkeys(s.strip().rstrip("/") for s in STORES if s.strip()))
 
@@ -146,6 +147,14 @@ HTML_STORES = {
             ("/collection/00_pre-order_onepiece", False),
         ],
     },
+    "https://www.gomerrycards.cl": {
+        "platform": "bsale",
+        "paths": [
+            ("/collection/one-piece-tcg", False),
+            ("/collection/preventa-one-piece", False),
+            ("/collection/preventas", True),        # mezcla juegos: solo títulos One Piece
+        ],
+    },
     # TCG Lab (Jumpseller) no tiene categoría de sellado: se usan búsquedas de producto
     # sellado. Las cartas sueltas se descartan con los filtros de siempre.
     "https://tcglab.cl": {
@@ -177,7 +186,8 @@ PREVENTA_RE = re.compile(r"pre[-\s]?venta|pre[-\s]?order", re.IGNORECASE)
 
 # Nombres de producto que interesan dentro de las colecciones de preventa
 TITLE_RE = re.compile(
-    r"one[-\s]?piece|\b(op|eb|prb|st)-?\d{1,2}\b|illustration[-\s]box|"
+    r"one[-\s]?piece|\b(op|eb|prb|st)-?\d{1,2}\b|illustration[-\s]box|gift[-\s]collection|heroines|"
+    r"card[-\s]collection|live[-\s]action[-\s]edition|"
     r"premium[-\s](extra[-\s])?booster|extra[-\s]booster",
     re.IGNORECASE,
 )
@@ -193,9 +203,32 @@ SINGLES_RE = re.compile(
 # --- Filtros por PRODUCTO (se aplican dentro de cada colección) -----------
 SINGLE_CARD_RE = re.compile(r"(?<![a-z])(op|eb|prb|st)-?\d{2}-\d{2,3}", re.IGNORECASE)
 
-UNWANTED_RE = re.compile(
+# Productos de colección sellados de Bandai: cualquier "Card Collection" / "Gift Collection"...
+# (Premium Card Collection -Live Action Edition-, Gift Collection Heroines, Best Selection...)
+# Se reconocen como One Piece aunque el título no lo diga, y NO se descartan por traer
+# palabras como "carpeta" o "álbum" (vienen en formato carpeta).
+COLLECTION_PRODUCT_RE = re.compile(
+    r"(premium[-\s])?card[-\s]collection|gift[-\s]collection|devil[-\s]fruits[-\s]collection|"
+    r"illustration[-\s]box|live[-\s]action[-\s]edition",
+    re.IGNORECASE,
+)
+
+# Accesorios genéricos (una carpeta Ultra Pro, sleeves...): se descartan salvo que sean
+# una colección de cartas de las de arriba
+ACCESSORY_RE = re.compile(
     r"sleeve|playmat|protector|porta[-\s]?mazo|deck[-\s]?box|(^|[-\s])dice([-\s]|$)|"
-    r"lego|paper[-\s]theater|tournament|prueba|"
+    r"carpeta|album|[aá]lbum|binder|portfolio",
+    re.IGNORECASE,
+)
+
+# Carta promo SUELTA que viene de una Premium Card Collection:
+#   handle "izo-premium-card-collection-film-red" o título "Izo (Premium Card Collection ...)"
+PROMO_SINGLE_HANDLE_RE = re.compile(
+    r"^(?!(one|live|premium|preventa|pre|pack|caja|box|set)-)[a-z]+(-[a-z]+)?-premium-card-collection")
+PROMO_SINGLE_TITLE_RE = re.compile(r"^[^()]{1,40}\(\s*premium[-\s]card[-\s]collection", re.IGNORECASE)
+
+UNWANTED_RE = re.compile(
+    r"lego|paper[-\s]theater|tournament|prueba|inscripci[oó]n|(^|[-\s])cupos?([-\s]|$)|torneo|"
     r"gundam|digimon|pok[eé]mon|(^|[-\s])magic([-\s]|$)|mtg|riftbound|dragon[-\s]?ball|"
     r"hololive|yu[-\s]?gi[-\s]?oh|"
     r"iron[-\s]blooded|eternal[-\s]nexus|g[-\s]generation|aquatic[-\s]assault|"
@@ -203,8 +236,7 @@ UNWANTED_RE = re.compile(
     r"unicorn|cosmic[-\s]crisis|destiny[-\s]ignition|generational[-\s]pulse|"
     r"promotion[-\s]cards|(^|[-\s])op[-\s]pr([-\s]|$)|jolly[-\s]roger[-\s]foil|"
     r"super[-\s]pre[-\s]release|pre[-\s]release[-\s]cards|alternate[-\s]art|parallel|manga|"
-    r"pirate[-\s]foil|full[-\s]art|bandai[-\s]card[-\s]games[-\s]fest|(^|[-\s])p[-\s]?\d{3}([-\s]|$)|"
-    r"^[a-z]+(-[a-z]+)?-premium-card-collection",
+    r"pirate[-\s]foil|full[-\s]art|bandai[-\s]card[-\s]games[-\s]fest|(^|[-\s])p[-\s]?\d{3}([-\s]|$)",
     re.IGNORECASE,
 )
 
@@ -212,6 +244,7 @@ UNWANTED_RE = re.compile(
 #  p. ej. "Illustration Box Vol. 7" o "Double Pack Set Vol.12")
 ONE_PIECE_RE = re.compile(
     r"one[-\s]?piece|illustration[-\s]box|double[-\s]pack[-\s]set|devil[-\s]fruits[-\s]collection|"
+    r"gift[-\s]collection|heroines|(premium[-\s])?card[-\s]collection|live[-\s]action[-\s]edition|"
     r"(^|-)op-|(^|[^a-z])(op|eb|prb|st|ib|dp|ts|sd|ln|lt|df|peb)-?\d{1,2}([^0-9a-z]|$)",
     re.IGNORECASE,
 )
@@ -226,7 +259,11 @@ def is_unwanted(p):
     handle = p["handle"].lower()
     text = f"{handle} {p['title'].lower()}"
     if not ONE_PIECE_RE.search(text):
-        return True
+        return True                                  # no es de One Piece
+    if PROMO_SINGLE_HANDLE_RE.search(handle) or PROMO_SINGLE_TITLE_RE.search(p["title"]):
+        return True                                  # carta promo suelta de una Premium Card Collection
+    if ACCESSORY_RE.search(text) and not COLLECTION_PRODUCT_RE.search(text):
+        return True                                  # accesorio genérico (carpeta, sleeves...)
     return bool(
         UNWANTED_RE.search(text)
         or SINGLE_CARD_RE.search(text)
@@ -539,7 +576,7 @@ def scan_html_store(base, cfg):
     preset = {**HTML_PRESETS[cfg.get("platform", "tiendanube")], **cfg}
     product_re = re.compile(preset["product_re"], re.IGNORECASE)
     skip_paths = {""} | {urlparse(p).path.rstrip("/") for p, _ in cfg["paths"]}
-    found = {}
+    found, taken = {}, set()     # taken: IDs ya guardados (evita el mismo producto con 2 URLs)
     for path, only_title in cfg["paths"]:
         seen = set()
         for page in range(1, preset.get("max_pages", 10) + 1):
@@ -557,11 +594,14 @@ def scan_html_store(base, cfg):
             seen.update(new)
             for pid in new:
                 it = items.pop(pid)
+                if pid in taken:
+                    continue
                 # se filtra solo por el título: el slug puede llevar sufijos aleatorios
                 if is_unwanted({"handle": "", "title": it["title"]}):
                     continue
                 if only_title and not TITLE_RE.search(it["title"]):
                     continue
+                taken.add(pid)
                 link_path = it.pop("path")
                 if preset.get("trailing_slash"):
                     link_path = link_path.rstrip("/") + "/"
@@ -729,27 +769,35 @@ def probar_telegram():
 
 def enviar_lista(results):
     """Manda a Telegram la lista de productos con stock, agrupada por tienda."""
-    lines, total = [], 0
+    by_store = {}                                   # dominio sin www -> {título: (link, producto)}
     for base, found, err in results:
         if err is not None or not found:
             continue
-        en_stock = [(l, p) for l, p in found.items() if p["available"]]
-        if not en_stock:
+        store = by_store.setdefault(_host(base), {})
+        for link, p in found.items():
+            key = re.sub(r"\W+", " ", p["title"].lower()).strip()
+            if p["available"] and key not in store:
+                store[key] = (link, p)
+    lines, total = [], 0
+    for host, items in by_store.items():
+        if not items:
             continue
-        total += len(en_stock)
-        lines.append(f"\n<b>{html.escape(base.replace('https://', ''))}</b>")
-        for link, p in sorted(en_stock, key=lambda x: x[1]["title"].lower()):
+        total += len(items)
+        lines.append(f"\n<b>{html.escape(host)}</b>")
+        for link, p in sorted(items.values(), key=lambda x: x[1]["title"].lower()):
             pre = " ⏳" if p["preorder"] else ""
             lines.append(f'• <a href="{link}">{html.escape(p["title"])}</a> — {fmt_price(p["price"])}{pre}')
     if not lines:
         telegram("📋 Ahora mismo no hay productos con stock en las tiendas vigiladas.")
         return
     header = f"📋 <b>Productos con stock ahora: {total}</b>  (⏳ = preventa)"
-    messages, cur = [], header
+    messages, cur, store_line = [], header, ""
     for line in lines:
+        if line.startswith("\n<b>"):
+            store_line = line
         if len(cur) + len(line) + 1 > 3800:
             messages.append(cur)
-            cur = ""
+            cur = "" if line is store_line else store_line + " (cont.)"
         cur += "\n" + line
     messages.append(cur)
     for m in messages:
